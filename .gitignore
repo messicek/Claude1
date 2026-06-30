@@ -1,0 +1,6 @@
+# Přihlašovací údaje – nikdy necommitovat
+.env
+
+# Python
+__pycache__/
+*.pyc
