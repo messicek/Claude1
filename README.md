@@ -15,10 +15,10 @@ BEACH_PASSWORD=tvojeheslo
 
 Když `.env` chybí, skript se na e-mail a heslo zeptá ručně.
 
-## `umbrella_count.py` – počet umbrell za ISO týden
+## `umbrella_count.py` – počet umbrell za měsíc (rozpad po týdnech)
 
-Spočítá, kolik **umbrell** je v daném **ISO týdnu** (Po–Ne) napříč **online**
-rezervacemi, a porovná zadané boxy.
+Spočítá, kolik **umbrell** je v zadaném **měsíci** napříč **online** rezervacemi,
+výsledek **rozepíše po ISO týdnech** (Po–Ne) a porovná zadané boxy.
 
 ### Co se počítá
 
@@ -30,9 +30,9 @@ Inventář má 3 typy položek: `combo`, `umbrella`, `chairs`.
 
 Příklad: rezervace `combo + umbrella` = 2 umbrelly.
 
-Metrika je **umbrella-dny**: pro každý den týdne se sečtou aktivní umbrelly,
-takže combo objednané na celý týden přispěje 7. To měří celkové vytížení boxu
-v daném týdnu a umožňuje srovnávat týdny i boxy mezi sebou.
+Metrika je **umbrella-dny**: pro každý den se sečtou aktivní umbrelly, takže
+combo objednané na 7 dní přispěje 7. To měří celkové vytížení boxu a umožňuje
+srovnávat měsíce, týdny i boxy mezi sebou.
 
 ### Spuštění
 
@@ -44,10 +44,25 @@ Skript se postupně zeptá na:
 
 1. **Boxy** – např. `43` nebo víc oddělených čárkou `42,43`
 2. **Rok** a **měsíc**
-3. **Týden** – vypíše Po–Ne týdny daného měsíce s konkrétními datumy, vybereš číslo
-4. **Jen online?** – `a` (jen `web_portal`) / `n` (všechny kanály)
+3. **Jen online?** – `a` (jen `web_portal`) / `n` (všechny kanály)
 
-Výstup: pro každý box celkový počet umbrella-dnů + denní rozpad (Po–Ne) a na
-konci porovnávací tabulka boxů seřazená sestupně.
+E-mail a heslo se načtou automaticky z `.env` (hledá se ve složce skriptu i v
+aktuální složce), takže je nemusíš psát.
+
+Výstup: pro každý box **měsíční součet** umbrella-dnů a pod ním **rozpad po ISO
+týdnech** (Po–Ne, ořezaných na měsíc – součet týdnů = měsíční součet). Když
+zadáš víc boxů, na konci se vypíše porovnávací tabulka podle měsíčního součtu.
+
+Příklad výstupu:
+
+```
+=== Box 43 ===
+Měsíc celkem: 123 umbrella-dnů
+  Týden 1  01.06.–07.06.  34
+  Týden 2  08.06.–14.06.  30
+  Týden 3  15.06.–21.06.  29
+  Týden 4  22.06.–28.06.  22
+  Týden 5  29.06.–30.06.   8
+```
 
 Zrušené rezervace se nepočítají.

@@ -52,20 +52,34 @@ CZ_MONTHS = [
     "", "leden", "únor", "březen", "duben", "květen", "červen",
     "červenec", "srpen", "září", "říjen", "listopad", "prosinec",
 ]
-CZ_DAYS = ["Po", "Út", "St", "Čt", "Pá", "So", "Ne"]
 
 
 def load_credentials():
-    """Načte BEACH_EMAIL/BEACH_PASSWORD z .env vedle skriptu; co chybí, doptá se."""
+    """Načte BEACH_EMAIL/BEACH_PASSWORD z .env; co chybí, doptá se.
+
+    Soubor .env se hledá ve složce skriptu i v aktuální pracovní složce – na
+    telefonu (Pydroid) se totiž cesta ke skriptu může lišit od pracovní složky.
+    Díky tomu se údaje načtou automaticky a nemusí se psát ručně.
+    """
     creds = {}
-    env_path = Path(__file__).resolve().parent / ".env"
-    if env_path.exists():
+    candidates = []
+    try:
+        candidates.append(Path(__file__).resolve().parent / ".env")
+    except NameError:
+        pass
+    candidates.append(Path.cwd() / ".env")
+
+    for env_path in candidates:
+        if not env_path.exists():
+            continue
         for line in env_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, _, val = line.partition("=")
-            creds[key.strip()] = val.strip().strip('"').strip("'")
+            creds.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+        break  # první nalezený .env vyhrává
+
     email = creds.get("BEACH_EMAIL") or input("E-mail: ").strip()
     password = creds.get("BEACH_PASSWORD") or input("Heslo: ").strip()
     return email, password
@@ -197,20 +211,16 @@ def booking_umbrellas(client, inventory_id, bid, only_online, cache):
     return count
 
 
-def week_box_umbrella_days(client, box, monday, only_online, cache):
-    """Pro box a ISO týden (od pondělí) vrať (jméno, celkem, denní rozpad 7 hodnot)."""
-    inv_id, box_name = client.resolve_box(box)
-    daily = []
-    for offset in range(7):
-        day = (monday + timedelta(days=offset)).isoformat()
-        day_total = 0
-        for bid in client.booking_ids_on(inv_id, day):
-            day_total += booking_umbrellas(client, inv_id, bid, only_online, cache)
-        daily.append(day_total)
-    return box_name, sum(daily), daily
+def days_umbrella_total(client, inv_id, days, only_online, cache):
+    """Součet umbrella-dnů pro daný seznam dat (objekty date) v jednom boxu."""
+    total = 0
+    for d in days:
+        for bid in client.booking_ids_on(inv_id, d.isoformat()):
+            total += booking_umbrellas(client, inv_id, bid, only_online, cache)
+    return total
 
 
-# ── Výběr ISO týdne (Po–Ne) ─────────────────────────────────────────────
+# ── Rozdělení měsíce na ISO týdny (Po–Ne) ───────────────────────────────
 
 def iso_weeks_of_month(year, month):
     """Seznam (pondělí, neděle) všech Po–Ne týdnů, které zasahují do měsíce."""
@@ -221,6 +231,27 @@ def iso_weeks_of_month(year, month):
     while monday <= last:
         weeks.append((monday, monday + timedelta(days=6)))
         monday += timedelta(days=7)
+    return weeks
+
+
+def month_weeks_clipped(year, month):
+    """Rozpad měsíce po ISO týdnech, ořezaný na měsíc.
+
+    Vrací seznam (label, [dny]) – dny jen v daném měsíci. Součet dnů přes
+    všechny týdny = všechny dny měsíce, žádný den mimo měsíc.
+    """
+    weeks = []
+    for mon, sun in iso_weeks_of_month(year, month):
+        days = [
+            mon + timedelta(days=i)
+            for i in range(7)
+            if (mon + timedelta(days=i)).month == month
+            and (mon + timedelta(days=i)).year == year
+        ]
+        if not days:
+            continue
+        label = f"{days[0].strftime('%d.%m.')}–{days[-1].strftime('%d.%m.')}"
+        weeks.append((label, days))
     return weeks
 
 
@@ -246,16 +277,6 @@ def ask_int(prompt, default, lo, hi):
         print(f"  Hodnota musí být {lo}–{hi}.")
 
 
-def choose_week(year, month):
-    """Vypíše Po–Ne týdny měsíce a nechá uživatele vybrat. Vrací pondělí."""
-    weeks = iso_weeks_of_month(year, month)
-    print(f"\nTýdny ({CZ_MONTHS[month]} {year}):")
-    for i, (mon, sun) in enumerate(weeks, 1):
-        print(f"  {i}. {mon.isoformat()} → {sun.isoformat()} (Po–Ne)")
-    idx = ask_int("Vyber týden (číslo)", 1, 1, len(weeks))
-    return weeks[idx - 1][0]
-
-
 def main():
     # Některé konzole (Windows cp1252) neumí diakritiku – přepni na UTF-8.
     for stream in (sys.stdout, sys.stderr):
@@ -264,13 +285,12 @@ def main():
         except (AttributeError, ValueError):
             pass
 
-    print("=== Beach Services NMB – počet umbrell za týden ===\n")
+    print("=== Beach Services NMB – počet umbrell za měsíc ===\n")
 
     box = ask("Boxy (např. 43 nebo 42,43)", BOX)
     today = date.today()
     year = ask_int("Rok", today.year, 2000, 2100)
     month = ask_int("Měsíc (1–12)", today.month, 1, 12)
-    monday = choose_week(year, month)
     only_online = ask("Jen online rezervace? (a/n)", "a" if JEN_ONLINE else "n")
     only_online = only_online.lower().startswith("a")
 
@@ -282,31 +302,37 @@ def main():
         print(f"\n[CHYBA] {e}")
         return
 
-    sunday = monday + timedelta(days=6)
+    weeks = month_weeks_clipped(year, month)  # [(label, [dny])]
     kanal = "online" if only_online else "všechny kanály"
-    print(
-        f"\n=== Umbrella-dny: {monday.isoformat()} → {sunday.isoformat()} "
-        f"(Po–Ne, {kanal}) ==="
-    )
+    print(f"\n##### {CZ_MONTHS[month].upper()} {year} – umbrella-dny ({kanal}) #####")
 
     cache = {}  # bid -> počet umbrell (sdíleno mezi boxy i dny)
     results = []
     for b in [x.strip() for x in box.split(",") if x.strip()]:
         try:
-            box_name, total, daily = week_box_umbrella_days(
-                client, b, monday, only_online, cache
-            )
+            inv_id, box_name = client.resolve_box(b)
         except (LookupError, requests.HTTPError) as e:
             print(f"\n[CHYBA] Box {b}: {e}")
             continue
 
-        rozpad = "  ".join(f"{CZ_DAYS[i]} {daily[i]}" for i in range(7))
-        print(f"\n{box_name}: celkem {total} umbrella-dnů")
-        print(f"  {rozpad}")
-        results.append((box_name, total))
+        try:
+            week_totals = [
+                (label, days_umbrella_total(client, inv_id, days, only_online, cache))
+                for label, days in weeks
+            ]
+        except requests.HTTPError as e:
+            print(f"\n[CHYBA] Box {b}: {e}")
+            continue
+
+        month_total = sum(t for _, t in week_totals)
+        print(f"\n=== {box_name} ===")
+        print(f"Měsíc celkem: {month_total} umbrella-dnů")
+        for i, (label, total) in enumerate(week_totals, 1):
+            print(f"  Týden {i}  {label}  {total}")
+        results.append((box_name, month_total))
 
     if len(results) > 1:
-        print("\n=== Porovnání boxů (umbrella-dny) ===")
+        print("\n=== Porovnání boxů (měsíc celkem) ===")
         width = max(len(name) for name, _ in results)
         for name, total in sorted(results, key=lambda r: r[1], reverse=True):
             print(f"  {name.ljust(width)}  {total}")
