@@ -1,14 +1,14 @@
-"""Beach Services NMB – počet UMBRELL za ISO týden (mobilní verze).
+"""Beach Services NMB – počet UMBRELL za měsíc (mobilní verze).
 
 Samostatný soubor, jediná závislost: `requests`. Po spuštění se postupně zeptá
-na boxy, rok, měsíc a vybraný ISO týden (Po–Ne), pak spočítá, kolik umbrell je
-v daném týdnu napříč ONLINE rezervacemi, a vypíše porovnání boxů.
+na boxy, rok, měsíc a jestli jen online, pak spočítá, kolik umbrell je v daném
+měsíci napříč rezervacemi, výsledek rozepíše po ISO týdnech (Po–Ne) a porovná boxy.
 
 == Co se počítá ==
   Inventář má 3 typy: combo, umbrella, chairs.
   Počítaná "umbrella" = combo + umbrella (každé × množství). Chairs se ignorují.
-  Metrika je UMBRELLA-DNY: pro každý den týdne se sečtou aktivní umbrelly, takže
-  combo objednané na celý týden přispěje 7 (= vytížení v týdnu).
+  Metrika je UMBRELLA-DNY: pro každý den se sečtou aktivní umbrelly, takže
+  combo objednané na 7 dní přispěje 7 (= vytížení).
 
 == Jak to rozjet na telefonu (Android, Pydroid 3) ==
   1. Nainstaluj appku "Pydroid 3" z Obchodu Play.
