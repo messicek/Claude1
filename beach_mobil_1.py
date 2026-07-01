@@ -1,30 +1,32 @@
-"""Beach Services NMB – počet UMBRELL za měsíc (mobilní verze).
+"""Beach Services NMB – MOBILNÍ verze (pro telefon, Pydroid 3 / Termux / a-Shell).
 
-Samostatný soubor, jediná závislost: `requests`. Po spuštění se postupně zeptá
-na boxy, rok, měsíc a jestli jen online, pak spočítá, kolik umbrell je v daném
-měsíci napříč rezervacemi, výsledek rozepíše po ISO týdnech (Po–Ne) a porovná boxy.
+Výpis rezervací. Po spuštění se zeptá na box, datum a režim (Enter = výchozí),
+pak vypíše rezervace.
 
-== Co se počítá ==
-  Inventář má 3 typy: combo, umbrella, chairs.
-  Počítaná "umbrella" = combo + umbrella (každé × množství). Chairs se ignorují.
-  Metrika je UMBRELLA-DNY: pro každý den se sečtou aktivní umbrelly, takže
-  combo objednané na 7 dní přispěje 7 (= vytížení).
+== Přihlášení proti WAF (Cloudflare) ==
+Server před API stojí za Cloudflare/WAF, který umí zablokovat "holé"
+python-requests kvůli TLS fingerprintu (typicky 403 z telefonu, i když na PC
+requests projde). Login proto zkouší postupně víc přenosových backendů:
+
+    1) requests     – nejrychlejší, funguje tam, kde WAF nevadí (často PC)
+    2) curl_cffi    – napodobí Chrome (TLS fingerprint + hlavičky) → obejde WAF
+    3) tls_client   – druhá napodobovací knihovna, když curl_cffi nejde
+
+Backend, který u loginu uspěje, se použije i pro všechny další požadavky.
+Při neúspěchu se vypíše CELÁ surová odpověď (status, hlavičky, tělo, cf-*).
 
 == Jak to rozjet na telefonu (Android, Pydroid 3) ==
-  1. Nainstaluj appku "Pydroid 3" z Obchodu Play.
-  2. V Pydroidu otevři menu (vlevo nahoře) -> "Pip" -> nainstaluj "requests".
-  3. Vedle tohoto souboru vytvoř textový soubor ".env" se dvěma řádky:
+  1. Nainstaluj "Pydroid 3" z Obchodu Play.
+  2. V Pydroidu menu -> "Pip" -> nainstaluj "requests" a "curl_cffi".
+     (Když curl_cffi nejde nainstalovat, zkus "tls_client".)
+  3. Vedle tohoto souboru vytvoř soubor ".env":
          BEACH_EMAIL=tvuj@email.cz
          BEACH_PASSWORD=tvojeheslo
-     (Když .env nebude, skript se na e-mail a heslo jednou zeptá ručně.)
   4. Otevři tento soubor v Pydroidu a klikni na žlutou šipku "Run".
-
-Logika i endpointy jsou shodné s ověřeným mobilním skriptem na výpis rezervací
-(reálné API api.beachservicesnmb.com).
 """
 
+import re
 import sys
-from calendar import monthrange
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -32,6 +34,8 @@ import requests
 
 # ── Výchozí hodnoty (jen Enter = tyto) ──────────────────────────────────
 BOX = "43"          # jeden box "43", nebo víc oddělených čárkou: "42,43"
+REZIM = "start"     # "start" = začínající (vybavení/adresa/termín/pozn.)
+                    # "end"   = končící (sběr vybavení) + telefon
 JEN_ONLINE = True   # True = jen online (web_portal); False = všechny kanály
 # ────────────────────────────────────────────────────────────────────────
 
@@ -40,11 +44,6 @@ API_URL = "https://api.beachservicesnmb.com"
 # Origin/Referer musí odpovídat webu, ze kterého API normálně chodí požadavky.
 # Známá funkční hodnota z desktopu je s "www"; kdyby WAF vadilo, zkus bez "www".
 SITE = "https://www.beachservicesnmb.com"
-
-CZ_MONTHS = [
-    "", "leden", "únor", "březen", "duben", "květen", "červen",
-    "červenec", "srpen", "září", "říjen", "listopad", "prosinec",
-]
 
 
 def browser_headers(for_impersonation=False):
@@ -80,13 +79,14 @@ class ApiError(Exception):
 
 
 # ── Přenosová vrstva s fallbackem (requests / curl_cffi / tls_client) ────
-# Server je za Cloudflare/WAF, který umí zablokovat "holé" python-requests
-# kvůli TLS fingerprintu (typicky 403 z telefonu). Login proto zkouší postupně
-# requests -> curl_cffi (napodobí Chrome) -> tls_client; úspěšný backend se
-# použije i pro další požadavky.
 
 class Transport:
-    """Jednotné rozhraní nad requests / curl_cffi / tls_client."""
+    """Jednotné rozhraní nad requests / curl_cffi / tls_client.
+
+    curl_cffi a tls_client napodobují prohlížeč (TLS fingerprint), což obejde
+    WAF blokující holé python-requests. Všechny tři vracejí objekt odpovědi
+    s .status_code, .headers, .text a .json().
+    """
 
     def __init__(self, backend):
         self.backend = backend
@@ -157,33 +157,8 @@ def dump_response(r):
         print("  >>> Detekován Cloudflare → jde o WAF (viz cf-ray / Server).")
 
 
-def _login_failed_help(backends, last_status):
-    lines = [
-        "Přihlášení selhalo přes všechny dostupné backendy "
-        f"({', '.join(backends)}); poslední status: {last_status}.",
-    ]
-    if "curl_cffi" not in backends and "tls_client" not in backends:
-        lines.append(
-            "Máš jen 'requests'. Když je to Cloudflare WAF (status 403 + cf-ray), "
-            "holé requests to neobejdou. V Pydroidu (menu -> Pip) nainstaluj "
-            "'curl_cffi'; kdyby nešlo, zkus 'tls_client'."
-        )
-    else:
-        lines.append(
-            "I napodobovací backend byl odmítnut. Zkontroluj e-mail/heslo, "
-            "případně jestli WAF nevyžaduje jiný Origin/Referer (viz vypsané "
-            "hlavičky výše) nebo neblokuje IP telefonu."
-        )
-    return "\n".join(lines)
-
-
 def load_credentials():
-    """Načte BEACH_EMAIL/BEACH_PASSWORD z .env; co chybí, doptá se.
-
-    Soubor .env se hledá ve složce skriptu i v aktuální pracovní složce – na
-    telefonu (Pydroid) se totiž cesta ke skriptu může lišit od pracovní složky.
-    Díky tomu se údaje načtou automaticky a nemusí se psát ručně.
-    """
+    """Načte BEACH_EMAIL/BEACH_PASSWORD z .env (složka skriptu i CWD); co chybí, doptá se."""
     creds = {}
     candidates = []
     try:
@@ -201,7 +176,7 @@ def load_credentials():
                 continue
             key, _, val = line.partition("=")
             creds.setdefault(key.strip(), val.strip().strip('"').strip("'"))
-        break  # první nalezený .env vyhrává
+        break
 
     email = creds.get("BEACH_EMAIL") or input("E-mail: ").strip()
     password = creds.get("BEACH_PASSWORD") or input("Heslo: ").strip()
@@ -272,8 +247,6 @@ class BeachClient:
 
     def resolve_box(self, box):
         """Číslo/název boxu -> (inventory_id, zobrazované jméno)."""
-        import re
-
         target = str(box).strip().lower()
         target_named = target if target.startswith("box") else f"box {target}"
         items = self.inventory()
@@ -314,116 +287,118 @@ class BeachClient:
             f"?scope=full&includeLocation=true"
         )["data"]
 
+    def booking_info(self, booking_id):
+        data = self._get(f"/api/bookings/{booking_id}")["data"]
+        cust = data.get("customer") or data.get("BookingCustomer") or {}
+        name = cust.get("name") or "(bez jména)"
+        phone = (cust.get("phone") or "").strip()
+        dial = (cust.get("dial_code") or "").strip()
+        if phone and dial:
+            phone = f"{dial} {phone}"
+        start_date = (data.get("start_date") or "")[:10]
+        end_date = (data.get("end_date") or "")[:10]
+        origin_channel = data.get("origin_channel") or ""
+        return name, phone, start_date, end_date, origin_channel
 
-# ── Logika počítání umbrell ─────────────────────────────────────────────
 
-def umbrella_count(rec):
-    """Počet umbrell v jedné rezervaci: combo + umbrella (× quantity).
+def _login_failed_help(backends, last_status):
+    lines = [
+        "Přihlášení selhalo přes všechny dostupné backendy "
+        f"({', '.join(backends)}); poslední status: {last_status}.",
+    ]
+    if "curl_cffi" not in backends and "tls_client" not in backends:
+        lines.append(
+            "Máš jen 'requests'. Když je to Cloudflare WAF (status 403 + cf-ray), "
+            "holé requests to neobejdou. V Pydroidu (menu -> Pip) nainstaluj "
+            "'curl_cffi'; kdyby nešlo, zkus 'tls_client'."
+        )
+    else:
+        lines.append(
+            "I napodobovací backend byl odmítnut. Zkontroluj e-mail/heslo, "
+            "případně jestli WAF nevyžaduje jiný Origin/Referer (viz vypsané "
+            "hlavičky výše) nebo neblokuje IP telefonu."
+        )
+    return "\n".join(lines)
 
-    Inventář má 3 typy (combo / umbrella / chairs). Combo i samostatná umbrella
-    se počítají jako 1 umbrella za kus; chairs (a cokoli ostatního) se ignoruje.
-    """
-    total = 0
+
+def equip_summary(rec):
+    counts = {}
     for it in rec.get("booking_items") or rec.get("bookingItems") or []:
+        q = it.get("quantity") or 1
         bundle = it.get("product_bundle") or {}
         product = it.get("product") or {}
-        name = (bundle.get("name") or product.get("name") or "").lower()
-        if "combo" in name or "umbrella" in name:
-            total += it.get("quantity") or 1
-    return total
+        name = bundle.get("name") or product.get("name") or "?"
+        name = name[:1].upper() + name[1:]
+        counts[name] = counts.get(name, 0) + q
+    return ", ".join(f"{k} ×{v}" for k, v in counts.items())
 
 
-def booking_umbrellas(client, inventory_id, bid, only_online, cache):
-    """Počet umbrell pro rezervaci s ohledem na stav a kanál (cachováno dle bid).
-
-    Vrací 0 pro zrušené rezervace a (při only_online) pro neonline kanály.
-    Stejná rezervace se v týdnu objeví ve více dnech – cache šetří API volání.
-    """
-    if bid in cache:
-        return cache[bid]
-
-    base = client._get(f"/api/bookings/{bid}")["data"]
-    status = base.get("booking_status")
-    channel = base.get("origin_channel") or ""
-
-    if status == "canceled" or (only_online and channel != "web_portal"):
-        cache[bid] = 0
-        return 0
-
-    real_inv = base.get("inventory_id") or inventory_id
-    try:
-        rec = client.booking_full(real_inv, bid)
-    except ApiError:
-        rec = base
-    count = umbrella_count(rec)
-    cache[bid] = count
-    return count
+def address_full(rec):
+    """Celá adresa vyplněná zákazníkem při online objednávce, jinak ''."""
+    md = rec.get("metadata") or {}
+    af = md.get("autofillAddress") or {}
+    return (af.get("fullAddress") or "").strip()
 
 
-def days_umbrella_total(client, inv_id, days, only_online, cache):
-    """Součet umbrella-dnů pro daný seznam dat (objekty date) v jednom boxu."""
-    total = 0
-    for d in days:
-        for bid in client.booking_ids_on(inv_id, d.isoformat()):
-            total += booking_umbrellas(client, inv_id, bid, only_online, cache)
-    return total
+def next_day(day):
+    """'2026-06-30' -> '2026-07-01'."""
+    return (date.fromisoformat(day) + timedelta(days=1)).isoformat()
 
 
-# ── Rozdělení měsíce na ISO týdny (Po–Ne) ───────────────────────────────
+def list_names(client, box, day, mode="end", only_online=True):
+    inv_id, box_name = client.resolve_box(box)
+    tomorrow = next_day(day)
+    ids = client.booking_ids_on(inv_id, day)
+    if mode == "end":
+        # Kdo končí ZÍTRA, je v zítřejším layoutu. Sjednotíme dnešní + zítřejší.
+        ids = sorted(set(ids) | set(client.booking_ids_on(inv_id, tomorrow)))
+    rows = []
+    for bid in ids:
+        if mode == "start":
+            base = client._get(f"/api/bookings/{bid}")["data"]
+            if base.get("booking_status") == "canceled":
+                continue
+            start_date = (base.get("start_date") or "")[:10]
+            channel = base.get("origin_channel") or ""
+            if start_date != day:
+                continue
+            if only_online and channel != "web_portal":
+                continue
+            real_inv = base.get("inventory_id") or inv_id
+            try:
+                rec = client.booking_full(real_inv, bid)
+            except ApiError:
+                rec = base
+            end_date = (rec.get("end_date") or "")[:10]
+            cust = rec.get("customer") or rec.get("BookingCustomer") or {}
+            notes = " / ".join(
+                x for x in (
+                    (rec.get("notes") or "").strip(),
+                    (rec.get("customer_notes") or "").strip(),
+                ) if x
+            )
+            rows.append({
+                "name": cust.get("name") or "(bez jména)",
+                "equip": equip_summary(rec),
+                "addr": address_full(rec),
+                "start": start_date,
+                "end": end_date,
+                "notes": notes,
+            })
+        else:
+            name, phone, start_date, end_date, channel = client.booking_info(bid)
+            if end_date not in (day, tomorrow):
+                continue
+            if only_online and channel != "web_portal":
+                continue
+            rows.append({"name": name, "phone": phone, "end": end_date})
+    return box_name, rows
 
-def iso_weeks_of_month(year, month):
-    """Seznam (pondělí, neděle) všech Po–Ne týdnů, které zasahují do měsíce."""
-    first = date(year, month, 1)
-    last = date(year, month, monthrange(year, month)[1])
-    monday = first - timedelta(days=first.weekday())  # pondělí týdne s 1. dnem
-    weeks = []
-    while monday <= last:
-        weeks.append((monday, monday + timedelta(days=6)))
-        monday += timedelta(days=7)
-    return weeks
-
-
-def month_weeks_clipped(year, month):
-    """Rozpad měsíce po ISO týdnech, ořezaný na měsíc.
-
-    Vrací seznam (label, [dny]) – dny jen v daném měsíci. Součet dnů přes
-    všechny týdny = všechny dny měsíce, žádný den mimo měsíc.
-    """
-    weeks = []
-    for mon, sun in iso_weeks_of_month(year, month):
-        days = [
-            mon + timedelta(days=i)
-            for i in range(7)
-            if (mon + timedelta(days=i)).month == month
-            and (mon + timedelta(days=i)).year == year
-        ]
-        if not days:
-            continue
-        label = f"{days[0].strftime('%d.%m.')}–{days[-1].strftime('%d.%m.')}"
-        weeks.append((label, days))
-    return weeks
-
-
-# ── Interaktivní vstup ──────────────────────────────────────────────────
 
 def ask(prompt, default):
     """input() s výchozí hodnotou (prázdný vstup = default)."""
     val = input(f"{prompt} [{default}]: ").strip()
     return val or default
-
-
-def ask_int(prompt, default, lo, hi):
-    """Celé číslo v rozsahu <lo, hi>, prázdný vstup = default."""
-    while True:
-        raw = ask(prompt, str(default))
-        try:
-            val = int(raw)
-        except ValueError:
-            print(f"  Zadej číslo {lo}–{hi}.")
-            continue
-        if lo <= val <= hi:
-            return val
-        print(f"  Hodnota musí být {lo}–{hi}.")
 
 
 def main():
@@ -434,14 +409,13 @@ def main():
         except (AttributeError, ValueError):
             pass
 
-    print("=== Beach Services NMB – počet umbrell za měsíc ===\n")
+    print("=== Beach Services NMB – výpis rezervací ===\n")
 
-    box = ask("Boxy (např. 43 nebo 42,43)", BOX)
-    today = date.today()
-    year = ask_int("Rok", today.year, 2000, 2100)
-    month = ask_int("Měsíc (1–12)", today.month, 1, 12)
-    only_online = ask("Jen online rezervace? (a/n)", "a" if JEN_ONLINE else "n")
-    only_online = only_online.lower().startswith("a")
+    box = ask("Box (např. 43 nebo 42,43)", BOX)
+    day = ask("Datum (RRRR-MM-DD)", date.today().isoformat())
+    rezim = ask("Režim (start/end)", REZIM).lower()
+    if rezim not in ("start", "end"):
+        rezim = REZIM
 
     try:
         email, password = load_credentials()
@@ -451,40 +425,52 @@ def main():
         print(f"\n[CHYBA] {e}")
         return
 
-    weeks = month_weeks_clipped(year, month)  # [(label, [dny])]
-    kanal = "online" if only_online else "všechny kanály"
-    print(f"\n##### {CZ_MONTHS[month].upper()} {year} – umbrella-dny ({kanal}) #####")
-
-    cache = {}  # bid -> počet umbrell (sdíleno mezi boxy i dny)
-    results = []
     for b in [x.strip() for x in box.split(",") if x.strip()]:
         try:
-            inv_id, box_name = client.resolve_box(b)
+            box_name, rows = list_names(client, b, day, mode=rezim, only_online=JEN_ONLINE)
         except (LookupError, ApiError) as e:
             print(f"\n[CHYBA] Box {b}: {e}")
             continue
 
-        try:
-            week_totals = [
-                (label, days_umbrella_total(client, inv_id, days, only_online, cache))
-                for label, days in weeks
-            ]
-        except ApiError as e:
-            print(f"\n[CHYBA] Box {b}: {e}")
-            continue
-
-        month_total = sum(t for _, t in week_totals)
-        print(f"\n=== {box_name} ===")
-        print(f"Měsíc celkem: {month_total} umbrella-dnů")
-        for i, (label, total) in enumerate(week_totals, 1):
-            print(f"  Týden {i}  {label}  {total}")
-        results.append((box_name, month_total))
-
-    if len(results) > 1:
-        print("\n=== Porovnání boxů (měsíc celkem) ===")
-        width = max(len(name) for name, _ in results)
-        for name, total in sorted(results, key=lambda r: r[1], reverse=True):
-            print(f"  {name.ljust(width)}  {total}")
+        popis = "začínající" if rezim == "start" else "končící"
+        kanal = " online" if JEN_ONLINE else ""
+        print(f"\n=== {box_name} –{kanal} {popis} {day} ===")
+        if rezim == "start":
+            if not rows:
+                print("(žádné rezervace)")
+            for r in sorted(rows, key=lambda r: r["name"].casefold()):
+                print(r["name"])
+                if r["equip"]:
+                    print(f"  vybavení: {r['equip']}")
+                if r["addr"]:
+                    print(f"  adresa:   {r['addr']}")
+                print(f"  termín:   {r['start']} → {r['end']}")
+                if r["notes"]:
+                    print(f"  pozn.:    {r['notes']}")
+            print(f"Celkem: {len(rows)}")
+        else:
+            tomorrow = next_day(day)
+            zitra = sorted(
+                (r for r in rows if r["end"] == tomorrow),
+                key=lambda r: r["name"].casefold(),
+            )
+            dnes = sorted(
+                (r for r in rows if r["end"] == day),
+                key=lambda r: r["name"].casefold(),
+            )
+            print(f"\n-- Zítra poslední den ({tomorrow}) → poslat SMS --")
+            if zitra:
+                for r in zitra:
+                    print(f"{r['name']} – {r['phone']}" if r["phone"] else r["name"])
+            else:
+                print("(nikdo)")
+            print(f"\n-- Končí DNES ({day}) --")
+            if dnes:
+                for r in dnes:
+                    print(f"{r['name']} – {r['phone']}" if r["phone"] else r["name"])
+            else:
+                print("(nikdo)")
+            print(f"\nCelkem – dnes: {len(dnes)} | zítra: {len(zitra)}")
 
 
 if __name__ == "__main__":

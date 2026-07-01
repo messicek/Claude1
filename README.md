@@ -1,8 +1,8 @@
 # Beach Services NMB – nástroje
 
-Sada jednoduchých skriptů (jediná závislost `requests`), které se přihlásí do
-reálného API `api.beachservicesnmb.com` a pracují s rezervacemi. Vhodné i na
-telefon (Pydroid 3 / Termux / a-Shell).
+Sada jednoduchých skriptů, které se přihlásí do reálného API
+`api.beachservicesnmb.com` a pracují s rezervacemi. Vhodné i na telefon
+(Pydroid 3 / Termux / a-Shell).
 
 ## Přihlášení
 
@@ -14,6 +14,36 @@ BEACH_PASSWORD=tvojeheslo
 ```
 
 Když `.env` chybí, skript se na e-mail a heslo zeptá ručně.
+
+## Závislosti a řešení 403 (Cloudflare/WAF)
+
+Základní závislost je `requests`. Server ale stojí za Cloudflare/WAF, který umí
+zablokovat „holé" `python-requests` kvůli TLS fingerprintu – typicky **403
+Forbidden při přihlášení z telefonu**, i když na PC stejný skript projde.
+
+Skripty to řeší samy: login zkouší postupně víc přenosových backendů a ten,
+který uspěje, použijí i pro další požadavky:
+
+1. **`requests`** – nejrychlejší, funguje tam, kde WAF nevadí (často PC),
+2. **`curl_cffi`** – napodobí Chrome (TLS fingerprint + hlavičky) → obejde WAF,
+3. **`tls_client`** – záložní napodobovací knihovna, když `curl_cffi` nejde.
+
+Při neúspěchu login vypíše **celou surovou odpověď** (status, hlavičky, tělo,
+`cf-*` signály), takže je hned vidět, jestli jde o Cloudflare.
+
+**Na telefonu (Pydroid 3):** v menu → *Pip* nainstaluj `requests` a `curl_cffi`.
+Kdyby `curl_cffi` nešlo nainstalovat (potřebuje binárku), zkus `tls_client`.
+
+Na PC:
+
+```
+pip install requests curl_cffi
+```
+
+## Nástroje
+
+- **`beach_mobil_1.py`** – výpis rezervací (začínající / končící) pro box a datum.
+- **`umbrella_count.py`** – počet umbrell za měsíc (viz níže).
 
 ## `umbrella_count.py` – počet umbrell za měsíc (rozpad po týdnech)
 
