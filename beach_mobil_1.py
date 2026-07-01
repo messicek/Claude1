@@ -78,7 +78,45 @@ class ApiError(Exception):
         self.headers = dict(headers or {})
 
 
-# ── Přenosová vrstva s fallbackem (requests / curl_cffi / tls_client) ────
+# ── Přenosová vrstva s fallbackem ───────────────────────────────────────
+
+def _browserish_session():
+    """requests.Session s upravenými TLS ciphery (Chrome-like).
+
+    Změní JA3 fingerprint oproti výchozímu python-requests BEZ jakékoli
+    nativní knihovny – funguje i v Pydroidu. Pomůže tam, kde WAF blokuje
+    default-python fingerprint (ne dokonalá náhrada prohlížeče, ale často stačí).
+    """
+    import ssl
+    from requests.adapters import HTTPAdapter
+
+    ciphers = (
+        "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
+        "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+        "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
+        "ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:"
+        "AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA"
+    )
+    ctx = ssl.create_default_context()
+    ctx.set_ciphers(ciphers)
+    try:
+        ctx.set_alpn_protocols(["h2", "http/1.1"])
+    except NotImplementedError:
+        pass
+
+    class _TlsAdapter(HTTPAdapter):
+        def init_poolmanager(self, *a, **kw):
+            kw["ssl_context"] = ctx
+            return super().init_poolmanager(*a, **kw)
+
+        def proxy_manager_for(self, *a, **kw):
+            kw["ssl_context"] = ctx
+            return super().proxy_manager_for(*a, **kw)
+
+    s = requests.Session()
+    s.mount("https://", _TlsAdapter())
+    return s
+
 
 class Transport:
     """Jednotné rozhraní nad requests / curl_cffi / tls_client.
@@ -92,6 +130,8 @@ class Transport:
         self.backend = backend
         if backend == "requests":
             self._s = requests.Session()
+        elif backend == "requests_tls":
+            self._s = _browserish_session()
         elif backend == "curl_cffi":
             from curl_cffi import requests as cffi
             self._s = cffi.Session(impersonate="chrome")
@@ -106,8 +146,12 @@ class Transport:
 
     @staticmethod
     def available():
-        """Seznam dostupných backendů v pořadí preference."""
-        backends = ["requests"]
+        """Seznam dostupných backendů v pořadí preference.
+
+        requests_tls je čistě pythonový (žádné nativní knihovny) → funguje i v
+        Pydroidu; zkusí se hned po holém requests.
+        """
+        backends = ["requests", "requests_tls"]
         try:
             import curl_cffi  # noqa: F401
             backends.append("curl_cffi")
@@ -121,7 +165,10 @@ class Transport:
         return backends
 
     def _headers(self, extra):
-        h = browser_headers(for_impersonation=(self.backend != "requests"))
+        # curl_cffi/tls_client si nastaví vlastní browser UA odpovídající JA3;
+        # requests a requests_tls potřebují náš browser UA.
+        own_ua = self.backend in ("curl_cffi", "tls_client")
+        h = browser_headers(for_impersonation=own_ua)
         if extra:
             h.update(extra)
         return h
@@ -140,21 +187,26 @@ class Transport:
 
 
 def dump_response(r):
-    """Vypíše CELOU surovou odpověď serveru (diagnostika WAF/Cloudflare)."""
+    """Vypíše CELOU surovou odpověď serveru (diagnostika WAF/proxy)."""
     hdrs = dict(r.headers)
     print("  STATUS:", r.status_code)
     print("  --- HLAVIČKY ---")
     for k, v in hdrs.items():
         print(f"  {k}: {v}")
-    cf = {k: v for k, v in hdrs.items()
-          if k.lower() in ("server", "cf-ray", "cf-mitigated", "cf-cache-status")}
-    print("  --- CLOUDFLARE SIGNÁLY ---")
-    print("  ", cf if cf else "(žádné cf-* hlavičky)")
+    signal = {k: v for k, v in hdrs.items()
+              if k.lower() in ("server", "cf-ray", "cf-mitigated", "cf-cache-status",
+                               "x-amzn-waf-action", "x-amzn-requestid", "x-amz-cf-id", "via")}
+    print("  --- WAF / PROXY SIGNÁLY ---")
+    print("  ", signal if signal else "(žádné)")
     print("  --- TĚLO (prvních 1500 znaků) ---")
     print("  " + (r.text or "")[:1500].replace("\n", "\n  "))
+    srv = str(hdrs.get("Server") or hdrs.get("server") or "").lower()
     lower = {k.lower() for k in hdrs}
-    if "cf-ray" in lower or any("cloudflare" in str(v).lower() for v in hdrs.values()):
-        print("  >>> Detekován Cloudflare → jde o WAF (viz cf-ray / Server).")
+    if "cf-ray" in lower or "cloudflare" in srv:
+        print("  >>> Cloudflare WAF (cf-ray / Server: cloudflare).")
+    elif "awselb" in srv or "cloudfront" in srv or "x-amzn-waf-action" in lower:
+        print("  >>> AWS (ALB/WAF) blokuje request – NE Cloudflare.")
+        print("      Typicky IP reputace/geo nebo TLS/JA3 fingerprint klienta.")
 
 
 def load_credentials():
@@ -306,17 +358,19 @@ def _login_failed_help(backends, last_status):
         "Přihlášení selhalo přes všechny dostupné backendy "
         f"({', '.join(backends)}); poslední status: {last_status}.",
     ]
-    if "curl_cffi" not in backends and "tls_client" not in backends:
+    have_impersonation = any(b in backends for b in ("curl_cffi", "tls_client"))
+    if not have_impersonation:
         lines.append(
-            "Máš jen 'requests'. Když je to Cloudflare WAF (status 403 + cf-ray), "
-            "holé requests to neobejdou. V Pydroidu (menu -> Pip) nainstaluj "
-            "'curl_cffi'; kdyby nešlo, zkus 'tls_client'."
+            "Zkoušely se jen pythonové backendy (requests, requests_tls). Pokud jde "
+            "o TLS/JA3 blok, nainstaluj v Pydroidu (menu -> Pip) 'curl_cffi' "
+            "(napodobí Chrome). Kdyby curl_cffi nešlo, zkus 'tls_client'; kdyby "
+            "ani to ne, viz README (Termux / test přes prohlížeč)."
         )
     else:
         lines.append(
-            "I napodobovací backend byl odmítnut. Zkontroluj e-mail/heslo, "
-            "případně jestli WAF nevyžaduje jiný Origin/Referer (viz vypsané "
-            "hlavičky výše) nebo neblokuje IP telefonu."
+            "I napodobovací backend (curl_cffi/tls_client) byl odmítnut → nejspíš to "
+            "NENÍ TLS fingerprint, ale blok podle IP/geo. Ověř přes prohlížeč na "
+            "telefonu (viz README) a zkus jinou síť (Wi-Fi <-> mobilní data)."
         )
     return "\n".join(lines)
 

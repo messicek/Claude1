@@ -15,30 +15,46 @@ BEACH_PASSWORD=tvojeheslo
 
 Když `.env` chybí, skript se na e-mail a heslo zeptá ručně.
 
-## Závislosti a řešení 403 (Cloudflare/WAF)
+## Závislosti a řešení 403 (WAF)
 
-Základní závislost je `requests`. Server ale stojí za Cloudflare/WAF, který umí
-zablokovat „holé" `python-requests` kvůli TLS fingerprintu – typicky **403
-Forbidden při přihlášení z telefonu**, i když na PC stejný skript projde.
+Základní závislost je `requests`. Server (za **AWS load balancerem** – v odpovědi
+`Server: awselb/2.0`, případně jinde Cloudflare) umí zablokovat „holé"
+`python-requests` kvůli **TLS/JA3 fingerprintu** – typicky **403 Forbidden při
+přihlášení z telefonu**, i když na PC stejný skript projde.
 
 Skripty to řeší samy: login zkouší postupně víc přenosových backendů a ten,
 který uspěje, použijí i pro další požadavky:
 
-1. **`requests`** – nejrychlejší, funguje tam, kde WAF nevadí (často PC),
-2. **`curl_cffi`** – napodobí Chrome (TLS fingerprint + hlavičky) → obejde WAF,
-3. **`tls_client`** – záložní napodobovací knihovna, když `curl_cffi` nejde.
+1. **`requests`** – holé requests (často projde na PC),
+2. **`requests_tls`** – requests s upravenými TLS ciphery (jiný JA3), **čistě
+   pythonový, bez nativních knihoven → funguje i v Pydroidu**,
+3. **`curl_cffi`** – napodobí Chrome (TLS fingerprint + hlavičky), potřebuje binárku,
+4. **`tls_client`** – záložní napodobovací knihovna.
 
 Při neúspěchu login vypíše **celou surovou odpověď** (status, hlavičky, tělo,
-`cf-*` signály), takže je hned vidět, jestli jde o Cloudflare.
-
-**Na telefonu (Pydroid 3):** v menu → *Pip* nainstaluj `requests` a `curl_cffi`.
-Kdyby `curl_cffi` nešlo nainstalovat (potřebuje binárku), zkus `tls_client`.
+WAF/proxy signály) a rozliší Cloudflare vs. AWS.
 
 Na PC:
 
 ```
 pip install requests curl_cffi
 ```
+
+### Když to z telefonu (Pydroid) pořád padá na 403
+
+Nejdřív zjisti, jestli jde o **fingerprint** (spraví napodobení prohlížeče), nebo
+o **IP blok** (klientská knihovna nepomůže):
+
+1. **Test přes prohlížeč na telefonu:** otevři `https://www.beachservicesnmb.com`
+   na stejném připojení a zkus se přihlásit.
+   - **Prohlížeč funguje, Python ne** → jde o TLS/JA3 → potřebuješ napodobení:
+     v Pydroidu (menu → *Pip*) nainstaluj `curl_cffi`; kdyby nešlo, `tls_client`.
+     (Backend `requests_tls` se zkouší automaticky a někdy stačí sám.)
+   - **Prohlížeč taky nefunguje** → blok podle **IP/geo**. Zkus jinou síť
+     (Wi-Fi ↔ mobilní data). Klientské knihovny to neobejdou.
+2. **Když `curl_cffi`/`tls_client` nejdou v Pydroidu nainstalovat** (chtějí
+   nativní binárku): použij **Termux** (`pkg install python`, pak
+   `pip install curl_cffi`) – tam nativní závislosti obvykle projdou.
 
 ## Nástroje
 
