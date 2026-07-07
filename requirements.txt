@@ -1,0 +1,7 @@
+# Základní přenos
+requests>=2.28
+
+# Napodobení prohlížeče (obejde Cloudflare/WAF blokující holé requests).
+# Na telefonu instaluj přes Pydroid -> Pip. Když curl_cffi nejde, zkus tls_client.
+curl_cffi>=0.7
+# tls_client>=1.0  # záložní varianta, odkomentuj podle potřeby
